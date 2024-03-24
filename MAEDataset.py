@@ -1,9 +1,12 @@
 
 from torch.utils.data import Dataset,DataLoader
-
-from nltk import word_tokenize, TreebankWordDetokenizer.is_nltk_available
 import nltk
-
+nltk.download('punkt')
+from nltk import word_tokenize, TreebankWordDetokenizer
+from transformers.utils.import_utils import is_nltk_available, NLTK_IMPORT_ERROR
+from transformers import AutoTokenizer
+from sentence_transformers.readers import InputExample
+import numpy as np
 from typing import List
 
 class MaskedAutoEncoderDataset(Dataset):
