@@ -2,7 +2,10 @@
 from torch import nn, Tensor
 from typing import Iterable, Dict
 from sentence_transformers import SentenceTransformer
+from transformers import AutoTokenizer,AutoModelForCausalLM,AutoConfig
+import logging
 
+logger = logging.getLogger(__name__)
 
 class MaskedAutoEncoderLoss(nn.Module):
     def __init__(self, model: SentenceTransformer, decoder_name_or_path: str = None):

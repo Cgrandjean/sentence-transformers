@@ -28,7 +28,9 @@ class MaskedAutoEncoderDataset(Dataset):
 
     def __getitem__(self, item):
         sent = self.sentences[item]
-        return InputExample(texts=[self.noisen(sent,MASK_ratio=0.15), self.noisen(sent,MASK_ratio=0.4),sent])
+        return InputExample(texts=[self.noisen(sent,MASK_ratio=0.15),
+                                   self.noisen(sent,MASK_ratio=0.4),
+                                   sent])
 
     def __len__(self):
         return len(self.sentences)
@@ -40,5 +42,6 @@ class MaskedAutoEncoderDataset(Dataset):
         # Apply the masking logic to each word and rejoin the sentence
         splitted_tokens = self.tokenizer.batch_encode_plus(words,return_attention_mask=False,return_token_type_ids=False,add_special_tokens=False)['input_ids']#encode each tokens in each
         masked_tokens =[[ mask_id if np.random.rand() < MASK_ratio else tok_id for tok_id in token]  for token in splitted_tokens]
+        
         masked_sentence=' '.join([self.tokenizer.decode(masked_token).replace(" ",'') for masked_token in masked_tokens])
         return masked_sentence
