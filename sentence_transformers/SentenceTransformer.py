@@ -1,10 +1,11 @@
+from contextlib import contextmanager
 import json
 import logging
 import os
 import shutil
 from collections import OrderedDict
 import warnings
-from typing import List, Dict, Tuple, Iterable, Type, Union, Callable, Optional, TYPE_CHECKING
+from typing import List, Dict, Literal, Tuple, Iterable, Type, Union, Callable, Optional, TYPE_CHECKING
 import numpy as np
 from numpy import ndarray
 import transformers
@@ -31,7 +32,9 @@ from .util import (
     load_file_path,
     save_to_hub_args_decorator,
     get_device_name,
+    truncate_embeddings,
 )
+from .quantization import quantize_embeddings
 from .models import Transformer, Pooling, Normalize
 from .model_card_templates import ModelCardTemplate
 from . import __version__
@@ -67,6 +70,8 @@ class SentenceTransformer(nn.Sequential):
         This option should only be set to True for repositories you trust and in which you have read the code, as it
         will execute code present on the Hub on your local machine.
     :param token: Hugging Face authentication token to download private models.
+    :param truncate_dim: The dimension to truncate sentence embeddings to. `None` does no truncation. Truncation is
+        only applicable during inference when `.encode` is called.
     """
 
     def __init__(
@@ -81,10 +86,12 @@ class SentenceTransformer(nn.Sequential):
         revision: Optional[str] = None,
         token: Optional[Union[bool, str]] = None,
         use_auth_token: Optional[Union[bool, str]] = None,
+        truncate_dim: Optional[int] = None,
     ):
         # Note: self._load_sbert_model can also update `self.prompts` and `self.default_prompt_name`
         self.prompts = prompts or {}
         self.default_prompt_name = default_prompt_name
+        self.truncate_dim = truncate_dim
         self._model_card_vars = {}
         self._model_card_text = None
         self._model_config = {}
@@ -212,6 +219,7 @@ class SentenceTransformer(nn.Sequential):
             logger.info("Use pytorch device_name: {}".format(device))
 
         self.to(device)
+        self.is_hpu_graph_enabled = False
 
         if self.default_prompt_name is not None and self.default_prompt_name not in self.prompts:
             raise ValueError(
@@ -252,7 +260,8 @@ class SentenceTransformer(nn.Sequential):
         prompt: Optional[str] = None,
         batch_size: int = 32,
         show_progress_bar: bool = None,
-        output_value: str = "sentence_embedding",
+        output_value: Optional[Literal["sentence_embedding", "token_embeddings"]] = "sentence_embedding",
+        precision: Literal["float32", "int8", "uint8", "binary", "ubinary"] = "float32",
         convert_to_numpy: bool = True,
         convert_to_tensor: bool = False,
         device: str = None,
@@ -275,15 +284,27 @@ class SentenceTransformer(nn.Sequential):
         :param output_value: The type of embeddings to return: "sentence_embedding" to get sentence embeddings,
             "token_embeddings" to get wordpiece token embeddings, and `None`, to get all output values. Defaults
             to "sentence_embedding".
+        :param precision: The precision to use for the embeddings. Can be "float32", "int8", "uint8", "binary", or
+            "ubinary". All non-float32 precisions are quantized embeddings. Quantized embeddings are smaller in
+            size and faster to compute, but may have a lower accuracy. They are useful for reducing the size
+            of the embeddings of a corpus for semantic search, among other tasks. Defaults to "float32".
         :param convert_to_numpy: Whether the output should be a list of numpy vectors. If False, it is a list of PyTorch tensors.
         :param convert_to_tensor: Whether the output should be one large tensor. Overwrites `convert_to_numpy`.
         :param device: Which `torch.device` to use for the computation.
         :param normalize_embeddings: Whether to normalize returned vectors to have length 1. In that case,
             the faster dot-product (util.dot_score) instead of cosine similarity can be used.
 
-        :return: By default, a list of tensors is returned. If convert_to_tensor, a stacked tensor is returned.
-            If convert_to_numpy, a numpy matrix is returned.
+        :return: By default, a 2d numpy array with shape [num_inputs, output_dimension] is returned. If only one string
+            input is provided, then the output is a 1d array with shape [output_dimension]. If `convert_to_tensor`, a
+            torch Tensor is returned instead. If `self.truncate_dim <= output_dimension` then output_dimension is
+            `self.truncate_dim`.
         """
+        if self.device.type == "hpu" and not self.is_hpu_graph_enabled:
+            import habana_frameworks.torch as ht
+
+            ht.hpu.wrap_in_hpu_graph(self, disable_tensor_cache=True)
+            self.is_hpu_graph_enabled = True
+
         self.eval()
         if show_progress_bar is None:
             show_progress_bar = (
@@ -348,6 +369,9 @@ class SentenceTransformer(nn.Sequential):
 
             with torch.no_grad():
                 out_features = self.forward(features)
+                out_features["sentence_embedding"] = truncate_embeddings(
+                    out_features["sentence_embedding"], self.truncate_dim
+                )
 
                 if output_value == "token_embeddings":
                     embeddings = []
@@ -376,13 +400,22 @@ class SentenceTransformer(nn.Sequential):
 
         all_embeddings = [all_embeddings[idx] for idx in np.argsort(length_sorted_idx)]
 
+        if precision and precision != "float32":
+            all_embeddings = quantize_embeddings(all_embeddings, precision=precision)
+
         if convert_to_tensor:
             if len(all_embeddings):
-                all_embeddings = torch.stack(all_embeddings)
+                if isinstance(all_embeddings, np.ndarray):
+                    all_embeddings = torch.from_numpy(all_embeddings)
+                else:
+                    all_embeddings = torch.stack(all_embeddings)
             else:
                 all_embeddings = torch.Tensor()
         elif convert_to_numpy:
-            all_embeddings = np.asarray([emb.numpy() for emb in all_embeddings])
+            if not isinstance(all_embeddings, np.ndarray):
+                all_embeddings = np.asarray([emb.numpy() for emb in all_embeddings])
+        elif isinstance(all_embeddings, np.ndarray):
+            all_embeddings = [torch.from_numpy(embedding) for embedding in all_embeddings]
 
         if input_was_string:
             all_embeddings = all_embeddings[0]
@@ -475,7 +508,7 @@ class SentenceTransformer(nn.Sequential):
         :param chunk_size: Sentences are chunked and sent to the individual processes. If none, it determine a sensible size.
         :param normalize_embeddings: Whether to normalize returned vectors to have length 1. In that case,
             the faster dot-product (util.dot_score) instead of cosine similarity can be used.
-        :return: Numpy matrix with all embeddings
+        :return: 2d numpy array with shape [num_inputs, output_dimension]
         """
 
         if chunk_size is None:
@@ -550,17 +583,63 @@ class SentenceTransformer(nn.Sequential):
         """
         Tokenizes the texts
         """
-        return self._first_module().tokenize(texts)
+        kwargs = {}
+        # HPU models reach optimal performance if the padding is not dynamic
+        if self.device.type == "hpu":
+            kwargs["padding"] = "max_length"
+
+        try:
+            return self._first_module().tokenize(texts, **kwargs)
+        except TypeError:
+            # In case some Module does not allow for kwargs in tokenize, we also try without any
+            return self._first_module().tokenize(texts)
 
     def get_sentence_features(self, *features):
         return self._first_module().get_sentence_features(*features)
 
     def get_sentence_embedding_dimension(self):
+        """
+        :return: The number of dimensions in the output of `encode`. If it's not known, it's `None`.
+        """
+        output_dim = None
         for mod in reversed(self._modules.values()):
             sent_embedding_dim_method = getattr(mod, "get_sentence_embedding_dimension", None)
             if callable(sent_embedding_dim_method):
-                return sent_embedding_dim_method()
-        return None
+                output_dim = sent_embedding_dim_method()
+                break
+        if self.truncate_dim is not None:
+            # The user requested truncation. If they set it to a dim greater than output_dim,
+            # no truncation will actually happen. So return output_dim insead of self.truncate_dim
+            return min(output_dim or np.inf, self.truncate_dim)
+        return output_dim
+
+    @contextmanager
+    def truncate_sentence_embeddings(self, truncate_dim: Optional[int]):
+        """
+        In this context, `model.encode` outputs sentence embeddings truncated at dimension `truncate_dim`.
+
+        This may be useful when you are using the same model for different applications where different dimensions
+        are needed.
+
+        :param truncate_dim: The dimension to truncate sentence embeddings to. `None` does no truncation.
+
+        Example::
+
+            from sentence_transformers import SentenceTransformer
+
+            model = SentenceTransformer("model-name")
+
+            with model.truncate_sentence_embeddings(truncate_dim=16):
+                embeddings_truncated = model.encode(["hello there", "hiya"])
+            assert embeddings_truncated.shape[-1] == 16
+
+        """
+        original_output_dim = self.truncate_dim
+        try:
+            self.truncate_dim = truncate_dim
+            yield
+        finally:
+            self.truncate_dim = original_output_dim
 
     def _first_module(self):
         """Returns the first module of this sequential embedder"""
@@ -700,18 +779,22 @@ class SentenceTransformer(nn.Sequential):
         organization: Optional[str] = None,
         token: Optional[str] = None,
         private: Optional[bool] = None,
+        safe_serialization: bool = True,
         commit_message: str = "Add new SentenceTransformer model.",
         local_model_path: Optional[str] = None,
         exist_ok: bool = False,
         replace_model_card: bool = False,
         train_datasets: Optional[List[str]] = None,
-    ):
+    ) -> str:
         """
+        DEPRECATED, use `push_to_hub` instead.
+
         Uploads all elements of this Sentence Transformer to a new HuggingFace Hub repository.
 
         :param repo_id: Repository name for your model in the Hub, including the user or organization.
         :param token: An authentication token (See https://huggingface.co/settings/token)
         :param private: Set to true, for hosting a private model
+        :param safe_serialization: If true, save the model using safetensors. If false, save the model the traditional PyTorch way
         :param commit_message: Message to commit while pushing.
         :param local_model_path: Path of the model locally. If set, this file path will be uploaded. Otherwise, the current model will be uploaded
         :param exist_ok: If true, saving to an existing repository is OK. If false, saving only to a new repository is possible
@@ -721,6 +804,11 @@ class SentenceTransformer(nn.Sequential):
 
         :return: The url of the commit of your model in the repository on the Hugging Face Hub.
         """
+        logger.warning(
+            "The `save_to_hub` method is deprecated and will be removed in a future version of SentenceTransformers."
+            " Please use `push_to_hub` instead for future model uploads."
+        )
+
         if organization:
             if "/" not in repo_id:
                 logger.warning(
@@ -736,6 +824,45 @@ class SentenceTransformer(nn.Sequential):
                     f'Providing an `organization` to `save_to_hub` is deprecated, please only use `repo_id="{repo_id}"` instead.'
                 )
 
+        return self.push_to_hub(
+            repo_id=repo_id,
+            token=token,
+            private=private,
+            safe_serialization=safe_serialization,
+            commit_message=commit_message,
+            local_model_path=local_model_path,
+            exist_ok=exist_ok,
+            replace_model_card=replace_model_card,
+            train_datasets=train_datasets,
+        )
+
+    def push_to_hub(
+        self,
+        repo_id: str,
+        token: Optional[str] = None,
+        private: Optional[bool] = None,
+        safe_serialization: bool = True,
+        commit_message: str = "Add new SentenceTransformer model.",
+        local_model_path: Optional[str] = None,
+        exist_ok: bool = False,
+        replace_model_card: bool = False,
+        train_datasets: Optional[List[str]] = None,
+    ) -> str:
+        """
+        Uploads all elements of this Sentence Transformer to a new HuggingFace Hub repository.
+
+        :param repo_id: Repository name for your model in the Hub, including the user or organization.
+        :param token: An authentication token (See https://huggingface.co/settings/token)
+        :param private: Set to true, for hosting a private model
+        :param safe_serialization: If true, save the model using safetensors. If false, save the model the traditional PyTorch way
+        :param commit_message: Message to commit while pushing.
+        :param local_model_path: Path of the model locally. If set, this file path will be uploaded. Otherwise, the current model will be uploaded
+        :param exist_ok: If true, saving to an existing repository is OK. If false, saving only to a new repository is possible
+        :param replace_model_card: If true, replace an existing model card in the hub with the automatically created model card
+        :param train_datasets: Datasets used to train the model. If set, the datasets will be added to the model card in the Hub.
+
+        :return: The url of the commit of your model in the repository on the Hugging Face Hub.
+        """
         api = HfApi(token=token)
         repo_url = api.create_repo(
             repo_id=repo_id,
@@ -756,6 +883,7 @@ class SentenceTransformer(nn.Sequential):
                     model_name=repo_url.repo_id,
                     create_model_card=create_model_card,
                     train_datasets=train_datasets,
+                    safe_serialization=safe_serialization,
                 )
                 folder_url = api.upload_folder(repo_id=repo_id, folder_path=tmp_dir, commit_message=commit_message)
 
